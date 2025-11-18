@@ -113,23 +113,25 @@ void CUser::AddAtom(unsigned short nAtom, bool fOrigin) {
 // 该函数用于批量添加用户的原子到用户数据库中，并根据规则传播这些原子。
 // 它接受起始用户哈希hashUserStart、待传播的原子向量vAtoms、是否为原点原子fOrigin作为参数。
 // 函数返回一个布尔值，表示操作是否成功。
-bool AddAtomsAndPropagate(uint256 hashUserStart,const vector<unsigned short> &vAtoms, bool fOrigin) {
- // 创建数据库对象，用于读写用户数据                           
+bool AddAtomsAndPropagate(uint256 hashUserStart,
+                          const vector<unsigned short> &vAtoms, bool fOrigin) {
+  // 创建数据库对象，用于读写用户数据
   CReviewDB reviewdb;
   // 创建一个数组包含两个map，一个用于处理入向原子，一个用于处理出向原子，交替使用
   map<uint256, vector<unsigned short>> pmapPropagate[2];
 
   // 初始化第一个map，将起始用户和待传播的原子加入
-  pmapPropagate[0][hashUserStart] = vAtoms; 
+  pmapPropagate[0][hashUserStart] = vAtoms;
 
   // 传播循环：从起始用户开始，根据规则传播原子
   for (int side = 0; !pmapPropagate[side].empty(); side = 1 - side) {
-    //在本次循环中，定义mapFrom为当前侧的map，mapTo为另一侧的map
+    // 在本次循环中，定义mapFrom为当前侧的map，mapTo为另一侧的map
     map<uint256, vector<unsigned short>> &mapFrom = pmapPropagate[side];
     map<uint256, vector<unsigned short>> &mapTo = pmapPropagate[1 - side];
 
     // 遍历当前侧的map，处理每个用户的原子传播
-    for (map<uint256, vector<unsigned short>>::iterator mi = mapFrom.begin();mi != mapFrom.end(); ++mi) {
+    for (map<uint256, vector<unsigned short>>::iterator mi = mapFrom.begin();
+         mi != mapFrom.end(); ++mi) {
       const uint256 &hashUser = (*mi).first;                  // 当前用户哈希
       const vector<unsigned short> &vReceived = (*mi).second; // 收到的原子
 
@@ -137,16 +139,19 @@ bool AddAtomsAndPropagate(uint256 hashUserStart,const vector<unsigned short> &vA
       /// the beginning of the list,
       ///// so the change would be right next to the vector size.
       // Read user
-      CUser user;// 从数据库读取当前用户数据
+      CUser user; // 从数据库读取当前用户数据
       reviewdb.ReadUser(hashUser, user);
-      unsigned int nIn = user.vAtomsIn.size();// 记录当前用户已正式接收的原子数量
-      unsigned int nNew = user.vAtomsNew.size();// 记录当前用户暂存的普通原子数量
-      unsigned int nOut = user.vAtomsOut.size();// 记录当前用户待传播的原子数量
+      unsigned int nIn =
+          user.vAtomsIn.size(); // 记录当前用户已正式接收的原子数量
+      unsigned int nNew =
+          user.vAtomsNew.size(); // 记录当前用户暂存的普通原子数量
+      unsigned int nOut = user.vAtomsOut.size(); // 记录当前用户待传播的原子数量
 
       // // 为当前用户添加原子
       foreach (unsigned short nAtom, vReceived)
         user.AddAtom(nAtom, fOrigin);
-      fOrigin = false;// 仅仅第一次传播的是原子原点，后续传播的原子都不是原点原子
+      fOrigin =
+          false; // 仅仅第一次传播的是原子原点，后续传播的原子都不是原点原子
 
       // Don't bother writing to disk if no changes
       // 如果当前用户的原子集合没有变化，跳过写入数据库
@@ -166,37 +171,64 @@ bool AddAtomsAndPropagate(uint256 hashUserStart,const vector<unsigned short> &vA
   return true;
 }
 
-// 评分的核心处理函数：AcceptReview
-// 该函数负责验证评分的合法性、更新数据库中的评分记录、创建用户之间的连接关系，并传播原子。
+/**
+处理用户评论的核心函数，负责验证评论合法性、存储评论内容、建立用户关系并触发原子传播机制。
+这是构建用户关系网络的关键步骤，为后续原子传播提供路径
+评论者始终是用户，被评论者理论上可以是用户或产品 ，通过 hashTo
+字段标识，但是实际上 被评论者只能是用户，不能是产品，因为所有原子处理操作都基于
+CUser 对象进行的。 虽然-函数AcceptReview允许 hashTo
+指向产品，但是当原子尝试传播到产品哈希时， 系统会尝试调用 ReadUser()
+方法，这可能导致错误！！中本聪没写完
+当一个用户发表评论时：
+1. 评论者通过私钥签名创建评论
+2. 系统验证签名并确认评论者身份
+3. 评论内容存储到目标实体（用户或产品）的评论集合中
+4. 评论者和被评论者之间建立链接关系
+5. 评论者的声誉原子（或零原子）传播给被评论者 */
 bool CReview::AcceptReview() {
-  // 确定时间戳
+  // - 为评论设置当前系统时间作为时间戳，记录评论的创建时间
   nTime = GetTime();
 
-  // 验证签名
+  // - 验证评论者的公钥是否与签名匹配，确保评论的真实性
   if (!CKey::Verify(vchPubKeyFrom, GetSigHash(), vchSig))
     return false;
-  // 读取数据库中的已有评分
+  // - 读取数据库中的已有评论，将当前评论添加到被评分用户的评论列表中
   CReviewDB reviewdb;
 
   // Add review text to recipient
+  // 数据库初始化：创建评论数据库访问对象，用于后续的读写操作
   vector<CReview> vReviews;
+  // 首先读取目标对象（ hashTo ）的现有评论列表
   reviewdb.ReadReviews(hashTo, vReviews);
+  //- 将当前评论添加到评论列表中
   vReviews.push_back(*this);
+  //- - 将更新后的评论列表写回数据库
   if (!reviewdb.WriteReviews(hashTo, vReviews))
     return false;
 
-  // 创建一个评分者和被评分者的连接关系
+  // 创建一个评分者和被评分者的连接关系，Link
   CUser user;
+  // 通过评论者公钥计算用户哈希（ hashFrom
+  // ），用于在数据库中查找评论者的用户信息
   uint256 hashFrom = Hash(vchPubKeyFrom.begin(), vchPubKeyFrom.end());
+  //- 数据库中读取评论者的用户数据
   reviewdb.ReadUser(hashFrom, user);
+  // 在评论者的 vLinksOut 列表中添加指向被评论对象的链接
   user.vLinksOut.push_back(hashTo);
+  //- - 写回更新后的用户数据
   if (!reviewdb.WriteUser(hashFrom, user))
     return false;
 
   reviewdb.Close(); // 关闭数据库
 
-  // Propagate atoms to recipient
-  vector<unsigned short> vZeroAtom(1, 0);
+  // 最后一个关键步骤：将原子传播给被评论者
+  //  Propagate atoms to recipient
+  vector<unsigned short> vZeroAtom(1, 0); // 创建一个包含单个零原子(值为0)的向量
+
+  // 调用 AddAtomsAndPropagate 函数将零原子或用户待传播原子传播给被评论者
+  //  这里出现零原子的情况是为了处理用户没有待传播原子的情况
+  // 优先使用评论者已有的声誉原子进行传播，这样可以传递评论者的信誉权重
+  //- - 当评论者没有声誉原子时，回退到使用零原子，这是一种优雅的降级处理
   if (!AddAtomsAndPropagate(
           hashTo, user.vAtomsOut.size() ? user.vAtomsOut : vZeroAtom, false))
     return false;
@@ -204,14 +236,24 @@ bool CReview::AcceptReview() {
   return true;
 }
 
+// 检查产品签名是否有效
+// 验证产品发布者的公钥是否与签名匹配，确保产品的真实性
 bool CProduct::CheckSignature() {
   return (CKey::Verify(vchPubKeyFrom, GetSigHash(), vchSig));
 }
 
+// 检查产品是否符合规范
+// 确保产品没有详细描述（mapDetails为空），也没有订单表单（vOrderForm为空）
+// 检查产品发布者的声誉原子数量是否有效
+/**-
+ * 代码将卖家的声誉原子数量直接关联到其发布的产品上，产品能够继承发布者的声誉，新用户可以通过
+ * nAtoms 值快速评估产品可信度*/
 bool CProduct::CheckProduct() {
   if (!CheckSignature())
     return false;
 
+  /**  检查产品是否为"摘要产品"(summary product)，即没有详细信息(
+   * mapDetails)和订单表单( vOrderForm ) */
   // Make sure it's a summary product
   if (!mapDetails.empty() || !vOrderForm.empty())
     return false;
